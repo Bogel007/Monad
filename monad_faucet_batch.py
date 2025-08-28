@@ -3,15 +3,15 @@ import time
 import random
 import threading
 import json
-import logging
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from web3 import Web3
 import os
 import sys
+import logging
 
 # ==========================
-# Konfigurasi Faucet & Wallet
+# Faucet & Wallet
 # ==========================
 DOMAIN = "faucet-miniapp.monad.xyz"
 BASE_URL = f"https://{DOMAIN}"
@@ -23,22 +23,16 @@ RPC_URL = "https://testnet-rpc.monad.xyz"
 MAIN_WALLET = "0x17014818ceb3cdd8ef179b1c8a33765de8611deb"
 CHAIN_ID = 10
 GAS_LIMIT = 21000
-
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
 
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 5
 THREADS_PER_BATCH = 5
-RETRY_BACKOFF = [1,2,4]  # detik
+RETRY_BACKOFF = [1,2,4,6,8]  # detik tiap attempt
 
 # ==========================
 # Logging
 # ==========================
-logging.basicConfig(
-    filename="bot.log",
-    filemode="a",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(filename="bot.log", level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ==========================
 # Dashboard
@@ -48,7 +42,7 @@ dashboard_lock = threading.Lock()
 stop_render_thread = threading.Event()
 
 def clear_console():
-    os.system('cls' if os.name == 'nt' else 'clear')
+    os.system('cls' if os.name=='nt' else 'clear')
 
 def render_dashboard():
     with dashboard_lock:
@@ -93,18 +87,24 @@ def load_proxies():
     except:
         return [None]
 
+UAS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
+    "Mozilla/5.0 (X11; Linux x86_64) Chrome/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) Safari/605.1.15",
+]
+
 # ==========================
 # Web3 Transfer
 # ==========================
 def send_to_main(wallet, private_key):
     try:
         balance = w3.eth.get_balance(wallet)
-        if balance <=0:
+        if balance<=0:
             return f"{wallet[:6]}... saldo kosong"
         nonce = w3.eth.get_transaction_count(wallet)
         gas_price = w3.eth.gas_price
         value = balance - gas_price * GAS_LIMIT
-        if value <=0:
+        if value<=0:
             return f"{wallet[:6]}... saldo tidak cukup"
         tx = {
             "to": MAIN_WALLET,
@@ -125,7 +125,7 @@ def send_to_main(wallet, private_key):
 # ==========================
 def make_session(proxy=None):
     s = requests.Session()
-    s.headers.update({"User-Agent": f"PythonBot-{random.randint(100,999)}","Accept":"application/json"})
+    s.headers.update({"User-Agent": random.choice(UAS),"Accept":"application/json"})
     if proxy:
         if not proxy.startswith("http"):
             proxy = "http://" + proxy
@@ -133,23 +133,25 @@ def make_session(proxy=None):
     return s
 
 def get_nonce(session, wallet):
-    try:
-        res = session.get(f"{GET_NONCE_ENDPOINT}?address={wallet}",timeout=15)
-        if res.status_code==200 and "nonce" in res.json():
-            return res.json()["nonce"]
-    except Exception as e:
-        logging.error(f"{wallet} | Nonce error: {e}")
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            res = session.get(f"{GET_NONCE_ENDPOINT}?address={wallet}", timeout=15)
+            if res.status_code==200 and "nonce" in res.json():
+                return res.json()["nonce"]
+        except:
+            pass
+        time.sleep(RETRY_BACKOFF[attempt%len(RETRY_BACKOFF)])
     return None
 
 def authenticate(session, wallet, private_key, fid=0):
-    nonce = get_nonce(session, wallet)
+    nonce = get_nonce(session,wallet)
     if not nonce:
         with dashboard_lock:
             dashboard_status[wallet]="❌ Gagal auth: nonce tidak diterima"
         return None
     message = encode_defunct(text=nonce)
     signed = Account.sign_message(message, private_key)
-    payload = {"fid": fid,"address": wallet,"signature":signed.signature.hex()}
+    payload = {"fid": fid,"address":wallet,"signature":signed.signature.hex()}
     try:
         res = session.post(POST_AUTH_ENDPOINT,json=payload,timeout=15)
         if res.status_code==200 and "token" in res.json():
@@ -157,29 +159,25 @@ def authenticate(session, wallet, private_key, fid=0):
                 dashboard_status[wallet]="✅ Auth berhasil"
             return res.json()["token"]
         else:
-            err_msg=res.json().get("error","Unknown")
+            err_msg = res.json().get("error","Unknown")
             with dashboard_lock:
                 dashboard_status[wallet]=f"❌ Gagal auth: {err_msg}"
-    except Exception as e:
+    except:
         with dashboard_lock:
-            dashboard_status[wallet]=f"⚠️ Error saat auth: {e}"
-        logging.error(f"{wallet} | Auth error: {e}")
+            dashboard_status[wallet]="⚠️ Error saat auth"
     return None
 
 def claim_faucet(session, token, wallet):
     headers={"Authorization":f"Bearer {token}"}
     try:
         res=session.post(POST_CLAIM_ENDPOINT,headers=headers,json={"address":wallet},timeout=15)
-        if res.status_code==200:
-            data=res.json()
-            if data.get("success"):
-                with dashboard_lock:
-                    dashboard_status[wallet]="✅ Claimed"
-                return True
-    except Exception as e:
+        if res.status_code==200 and res.json().get("success"):
+            with dashboard_lock:
+                dashboard_status[wallet]="✅ Claimed"
+            return True
+    except:
         with dashboard_lock:
-            dashboard_status[wallet]=f"⚠️ Claim error: {e}"
-        logging.error(f"{wallet} | Claim error: {e}")
+            dashboard_status[wallet]="⚠️ Claim error"
     return False
 
 # ==========================
@@ -192,34 +190,25 @@ def worker(acc, proxies):
     proxy=random.choice(proxies)
     session=make_session(proxy)
 
-    for attempt in range(MAX_ATTEMPTS):
-        token=authenticate(session,wallet,private_key,fid)
-        if not token:
-            time.sleep(RETRY_BACKOFF[attempt%len(RETRY_BACKOFF)])
-            continue
-        success=claim_faucet(session,token,wallet)
-        if success:
-            transfer_res=send_to_main(wallet,private_key)
-            with dashboard_lock:
-                dashboard_status[wallet]+=f" | {transfer_res}"
-            return
-        else:
-            time.sleep(RETRY_BACKOFF[attempt%len(RETRY_BACKOFF)])
-    with dashboard_lock:
-        dashboard_status[wallet]+=" | ❌ Gagal total"
+    token=authenticate(session,wallet,private_key,fid)
+    if not token:
+        return
+    success=claim_faucet(session,token,wallet)
+    if success:
+        transfer_res=send_to_main(wallet,private_key)
+        with dashboard_lock:
+            dashboard_status[wallet]+=f" | {transfer_res}"
 
 # ==========================
-# Main Loop
+# Main
 # ==========================
 def main():
     accounts=load_accounts()
     proxies=load_proxies()
-
     if not accounts:
         print("❌ Tidak ada akun di data.json")
         return
     if not proxies:
-        print("❌ Tidak ada proxy, lanjut tanpa proxy")
         proxies=[None]
 
     render_thread=threading.Thread(target=dashboard_loop)
@@ -236,7 +225,6 @@ def main():
 
     for t in threads:
         t.join()
-
     stop_render_thread.set()
     render_thread.join()
 
